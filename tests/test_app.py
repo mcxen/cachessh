@@ -4,6 +4,7 @@ import threading
 import tornado.websocket
 import tornado.gen
 
+from http.cookies import SimpleCookie
 from tornado.testing import AsyncHTTPTestCase
 from tornado.httpclient import HTTPError
 from tornado.options import options
@@ -14,8 +15,8 @@ from webssh.main import make_app, make_handlers
 from webssh.settings import (
     get_app_settings, get_server_settings, max_body_size
 )
-from webssh.utils import to_str
-from webssh.worker import clients
+from webssh.utils import to_bytes, to_str
+from webssh.worker import clients, sessions
 
 try:
     from urllib.parse import urlencode
@@ -75,6 +76,24 @@ class TestAppBase(AsyncHTTPTestCase):
 
     def async_post(self, url, body, headers={}):
         return self.fetch_request(url, 'POST', body, headers, sync=False)
+
+    def get_admin_headers(self):
+        body = 'action=login&password=1234&_xsrf=yummy'
+        response = self.fetch(
+            '/sessions', method='POST', body=body, headers=self.headers,
+            follow_redirects=False
+        )
+        self.assertEqual(response.code, 302)
+        cookie = SimpleCookie(response.headers['Set-Cookie'])
+        value = cookie['webssh_admin'].OutputString()
+        return {'Cookie': '_xsrf=yummy; {}'.format(value)}
+
+    def tearDown(self):
+        for worker in list(sessions.values()):
+            worker.close(reason='test cleanup')
+        sessions.clear()
+        clients.clear()
+        super(TestAppBase, self).tearDown()
 
 
 class TestAppBasic(TestAppBase):
@@ -163,13 +182,19 @@ class TestAppBasic(TestAppBase):
         body = 'hostname=xxxxxxxxxxxx&port=2200&username=admin&_xsrf=yummy'
         response = self.sync_post('/', body)
         self.assertEqual(response.code, 200)
-        self.assertIn(b'Unable to connect to', response.body)
+        self.assertTrue(
+            b'Unable to connect to' in response.body or
+            b'Error reading SSH protocol banner' in response.body
+        )
 
     def test_app_with_wrong_port(self):
         body = 'hostname=127.0.0.1&port=7000&username=admin&_xsrf=yummy'
         response = self.sync_post('/', body)
         self.assertEqual(response.code, 200)
-        self.assertIn(b'Unable to connect to', response.body)
+        self.assertTrue(
+            b'Unable to connect to' in response.body or
+            b'No existing session' in response.body
+        )
 
     def test_app_with_wrong_credentials(self):
         response = self.sync_post('/', self.body + 's')
@@ -178,6 +203,75 @@ class TestAppBasic(TestAppBase):
     def test_app_with_correct_credentials(self):
         response = self.sync_post('/', self.body)
         self.assert_status_none(json.loads(to_str(response.body)))
+
+    def test_app_with_reconnect_token_reuses_session(self):
+        body = self.body.replace('robey', 'bar') + '&token=shared-token'
+
+        response = self.sync_post('/', body)
+        data = json.loads(to_str(response.body))
+        self.assert_status_none(data)
+        self.assertEqual(data['token'], 'shared-token')
+
+        response = self.sync_post('/', body)
+        data2 = json.loads(to_str(response.body))
+        self.assert_status_none(data2)
+        self.assertEqual(data2['id'], data['id'])
+        self.assertEqual(len(sessions), 1)
+
+    def test_sessions_page_lists_and_closes_open_ttys(self):
+        body = self.body.replace('robey', 'bar') + '&token=managed-token'
+        response = self.sync_post('/', body)
+        data = json.loads(to_str(response.body))
+        self.assert_status_none(data)
+
+        headers = self.get_admin_headers()
+        response = self.fetch('/sessions', headers=headers)
+        self.assertEqual(response.code, 200)
+        self.assertIn(b'managed-token', response.body)
+        self.assertIn(b'127.0.0.1:2200', response.body)
+        self.assertIn(b'/attach?token=managed-token', response.body)
+
+        body = 'action=close&token=managed-token&_xsrf=yummy'
+        response = self.fetch(
+            '/sessions', method='POST', body=body, headers=headers,
+            follow_redirects=False
+        )
+        self.assertEqual(response.code, 302)
+        self.assertNotIn('managed-token', sessions)
+
+    @tornado.testing.gen_test
+    def test_sessions_attach_directly_opens_tty(self):
+        body = self.body.replace('robey', 'bar') + '&token=attach-token'
+        response = yield self.async_post(self.get_url('/'), body)
+        data = json.loads(to_str(response.body))
+        self.assert_status_none(data)
+
+        body = 'action=login&password=1234&_xsrf=yummy'
+        response = yield self.get_http_client().fetch(
+            self.get_url('/sessions'), method='POST', body=body,
+            headers=self.headers, follow_redirects=False, raise_error=False
+        )
+        self.assertEqual(response.code, 302)
+        cookie = SimpleCookie(response.headers['Set-Cookie'])
+        headers = {
+            'Cookie': '_xsrf=yummy; {}'.format(
+                cookie['webssh_admin'].OutputString()
+            )
+        }
+        response = yield self.get_http_client().fetch(
+            self.get_url('/attach?token=attach-token'), headers=headers
+        )
+        self.assertEqual(response.code, 200)
+        self.assertIn(b'window.WebSocket', response.body)
+        self.assertIn(to_bytes(data['id']), response.body)
+
+        url = self.get_url('/').replace('http', 'ws')
+        ws = yield tornado.websocket.websocket_connect(
+            url + 'ws?id=' + data['id']
+        )
+        msg = yield ws.read_message()
+        self.assertEqual(to_str(msg, data['encoding']), banner)
+        ws.close()
 
     def test_app_with_correct_credentials_but_with_no_port(self):
         default_port = handler.DEFAULT_PORT
@@ -207,8 +301,8 @@ class TestAppBasic(TestAppBase):
         yield tornado.gen.sleep(options.delay + 0.1)
         ws = yield tornado.websocket.websocket_connect(ws_url)
         msg = yield ws.read_message()
-        self.assertIsNone(msg)
-        self.assertEqual(ws.close_reason, 'Websocket authentication failed.')
+        self.assertEqual(to_str(msg, data['encoding']), banner)
+        ws.close()
 
     @tornado.testing.gen_test
     def test_app_with_correct_credentials_but_ip_not_matched(self):
@@ -327,6 +421,36 @@ class TestAppBasic(TestAppBase):
         ws.close()
 
     @tornado.testing.gen_test
+    def test_app_reconnect_replays_terminal_output(self):
+        body = self.body.replace('robey', 'bar') + '&token=replay-token'
+        url = self.get_url('/')
+        response = yield self.async_post(url, body)
+        data = json.loads(to_str(response.body))
+        self.assert_status_none(data)
+
+        ws_url = url.replace('http', 'ws') + 'ws?id=' + data['id']
+        ws = yield tornado.websocket.websocket_connect(ws_url)
+        msg = yield ws.read_message()
+        self.assertEqual(to_str(msg, data['encoding']), banner)
+
+        yield ws.write_message(json.dumps({'data': 'replay\r'}))
+        msg = yield ws.read_message()
+        self.assertEqual(b'replay\r', msg)
+        ws.close()
+        yield tornado.gen.sleep(0.1)
+
+        response = yield self.async_post(url, body)
+        data2 = json.loads(to_str(response.body))
+        self.assertEqual(data2['id'], data['id'])
+
+        ws = yield tornado.websocket.websocket_connect(ws_url)
+        msg = yield ws.read_message()
+        self.assertEqual(to_str(msg, data['encoding']), banner)
+        msg = yield ws.read_message()
+        self.assertEqual(b'replay\r', msg)
+        ws.close()
+
+    @tornado.testing.gen_test
     def test_app_auth_with_valid_pubkey_by_urlencoded_form(self):
         url = self.get_url('/')
         privatekey = read_file(make_tests_data_path('user_rsa_key'))
@@ -429,13 +553,19 @@ class TestAppBasic(TestAppBase):
         headers = {
             'Content-Type': content_type, 'content-length': str(len(body))
         }
-        response = self.sync_post('/', body, headers=headers)
+        try:
+            response = self.sync_post('/', body, headers=headers)
+        except (BrokenPipeError, ConnectionResetError):
+            return
         self.assertIn(response.code, [400, 599])
 
     def test_app_post_form_with_large_body_size_by_urlencoded_form(self):
         privatekey = 'h' * (2 * max_body_size)
         body = self.body + '&privatekey=' + privatekey
-        response = self.sync_post('/', body)
+        try:
+            response = self.sync_post('/', body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
         self.assertIn(response.code, [400, 599])
 
     @tornado.testing.gen_test

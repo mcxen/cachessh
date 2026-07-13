@@ -54,8 +54,9 @@ jQuery(function($){
       state = DISCONNECTED,
       messages = {1: 'This client is connecting ...', 2: 'This client is already connnected.'},
       key_max_size = 16384,
+      token_max_size = 128,
       fields = ['hostname', 'port', 'username'],
-      form_keys = fields.concat(['password', 'totp']),
+      form_keys = fields.concat(['password', 'totp', 'token']),
       opts_keys = ['bgcolor', 'title', 'encoding', 'command', 'term', 'fontsize', 'fontcolor', 'cursor'],
       url_form_data = {},
       url_opts_data = {},
@@ -123,6 +124,21 @@ jQuery(function($){
        console.error(e);
     }
     return null;
+  }
+
+
+  function update_token_url(token) {
+    if (!token || !window.URL || !window.history) {
+      return;
+    }
+
+    try {
+      var url = new window.URL(window.location.href);
+      url.searchParams.set('token', token);
+      window.history.replaceState(null, '', url.toString());
+    } catch (e) {
+      console.error(e);
+    }
   }
 
 
@@ -202,6 +218,31 @@ jQuery(function($){
     });
   }
 
+
+  function build_terminal_theme() {
+    return {
+      background: url_opts_data.bgcolor || '#000000',
+      foreground: url_opts_data.fontcolor || '#e5e7eb',
+      cursor: url_opts_data.cursor || url_opts_data.fontcolor || '#ffffff',
+      black: '#000000',
+      red: '#cd3131',
+      green: '#0dbc79',
+      yellow: '#e5e510',
+      blue: '#2472c8',
+      magenta: '#bc3fbc',
+      cyan: '#11a8cd',
+      white: '#e5e5e5',
+      brightBlack: '#666666',
+      brightRed: '#f14c4c',
+      brightGreen: '#23d18b',
+      brightYellow: '#f5f543',
+      brightBlue: '#3b8eea',
+      brightMagenta: '#d670d6',
+      brightCyan: '#29b8db',
+      brightWhite: '#ffffff'
+    };
+  }
+
   function custom_font_is_loaded() {
     if (!custom_font) {
       console.log('No custom font specified.');
@@ -254,7 +295,7 @@ jQuery(function($){
   }
 
 
-  function read_as_text_with_decoder(file, callback, decoder) {
+  function read_as_text_with_decoder(file, callback, decoder, stream) {
     var reader = new window.FileReader();
 
     if (decoder === undefined) {
@@ -264,7 +305,7 @@ jQuery(function($){
     reader.onload = function() {
       var text;
       try {
-        text = decoder.decode(reader.result);
+        text = decoder.decode(reader.result, stream ? {'stream': true} : undefined);
       } catch (TypeError) {
         console.log('Decoding error happened.');
       } finally {
@@ -303,11 +344,11 @@ jQuery(function($){
   }
 
 
-  function read_file_as_text(file, callback, decoder) {
+  function read_file_as_text(file, callback, decoder, stream) {
     if (!window.TextDecoder) {
       read_as_text_with_encoding(file, callback, decoder);
     } else {
-      read_as_text_with_decoder(file, callback, decoder);
+      read_as_text_with_decoder(file, callback, decoder, stream);
     }
   }
 
@@ -358,20 +399,25 @@ jQuery(function($){
       return;
     }
 
+    if (msg.token) {
+      $('#token').val(msg.token);
+      update_token_url(msg.token);
+    }
+
     var ws_url = window.location.href.split(/\?|#/, 1)[0].replace('http', 'ws'),
         join = (ws_url[ws_url.length-1] === '/' ? '' : '/'),
-        url = ws_url + join + 'ws?id=' + msg.id,
+        url = ws_url + join + 'ws?id=' + encodeURIComponent(msg.id),
         sock = new window.WebSocket(url),
         encoding = 'utf-8',
         decoder = window.TextDecoder ? new window.TextDecoder(encoding) : encoding,
         terminal = document.getElementById('terminal'),
         termOptions = {
           cursorBlink: true,
-          theme: {
-            background: url_opts_data.bgcolor || 'black',
-            foreground: url_opts_data.fontcolor || 'white',
-            cursor: url_opts_data.cursor || url_opts_data.fontcolor || 'white'
-          }
+          allowTransparency: true,
+          drawBoldTextInBrightColors: true,
+          macOptionIsMeta: true,
+          windowsMode: true,
+          theme: build_terminal_theme()
         };
 
     if (url_opts_data.fontsize) {
@@ -541,7 +587,7 @@ jQuery(function($){
     };
 
     sock.onmessage = function(msg) {
-      read_file_as_text(msg.data, term_write, decoder);
+      read_file_as_text(msg.data, term_write, decoder, true);
     };
 
     sock.onerror = function(e) {
@@ -549,6 +595,9 @@ jQuery(function($){
     };
 
     sock.onclose = function(e) {
+      if (window.TextDecoder && decoder && decoder.decode) {
+        term_write(decoder.decode());
+      }
       term.dispose();
       term = undefined;
       sock = undefined;
@@ -602,6 +651,7 @@ jQuery(function($){
     var hostname = data.get('hostname'),
         port = data.get('port'),
         username = data.get('username'),
+        token = data.get('token'),
         pk = data.get('privatekey'),
         result = {
           valid: false,
@@ -609,6 +659,23 @@ jQuery(function($){
           title: ''
         },
         errors = [], size;
+
+    if (token && (
+        token.length > token_max_size || !/^[A-Za-z0-9_.~-]+$/.test(token))) {
+      errors.push('Invalid access token.');
+    }
+
+    if (errors.length) {
+      result.errors = errors;
+      return result;
+    }
+
+    if (token && !hostname) {
+      result.valid = true;
+      result.title = 'WebSSH';
+      result.errors = [];
+      return result;
+    }
 
     if (!hostname) {
       errors.push('Value of hostname is required.');
@@ -749,7 +816,7 @@ jQuery(function($){
   }
 
 
-  function connect(hostname, port, username, password, privatekey, passphrase, totp) {
+  function connect(hostname, port, username, password, privatekey, passphrase, totp, token) {
     // for console use
     var result, opts;
 
@@ -769,7 +836,8 @@ jQuery(function($){
           password: password,
           privatekey: privatekey,
           passphrase: passphrase,
-          totp: totp
+          totp: totp,
+          token: token
         };
       } else {
         opts = hostname;

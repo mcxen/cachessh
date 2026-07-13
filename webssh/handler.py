@@ -1,8 +1,12 @@
 import io
 import json
 import logging
+import hashlib
+import os
+import re
 import socket
 import struct
+import time
 import traceback
 import weakref
 import paramiko
@@ -17,7 +21,9 @@ from webssh.utils import (
     to_int, to_ip_address, UnicodeType, is_ip_hostname, is_same_primary_domain,
     is_valid_encoding
 )
-from webssh.worker import Worker, recycle_worker, clients
+from webssh.worker import (
+    Worker, recycle_worker, clients, sessions, session_history
+)
 
 try:
     from json.decoder import JSONDecodeError
@@ -31,6 +37,10 @@ except ImportError:
 
 
 DEFAULT_PORT = 22
+MAX_TOKEN_LENGTH = 128
+DEFAULT_ADMIN_PASSWORD = '1234'
+ADMIN_COOKIE_NAME = 'webssh_admin'
+TOKEN_PATTERN = re.compile(r'^[A-Za-z0-9_.~-]+$')
 
 swallow_http_errors = True
 redirecting = None
@@ -38,6 +48,47 @@ redirecting = None
 
 class InvalidValueError(Exception):
     pass
+
+
+def bind_worker_to_client(worker, src_addr):
+    ip, port = src_addr
+    workers = clients.get(ip, {})
+    if not workers:
+        clients[ip] = workers
+    worker.src_addr = (ip, port)
+    workers[worker.id] = worker
+    return workers
+
+
+def get_admin_password_file():
+    filename = options.admin_password_file
+    if not filename:
+        filename = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), 'env', 'admin_password.txt')
+    return filename
+
+
+def get_admin_password():
+    filename = get_admin_password_file()
+    try:
+        with open(filename, 'r') as fp:
+            password = fp.read().strip()
+            if password:
+                return password
+    except IOError:
+        pass
+    return DEFAULT_ADMIN_PASSWORD
+
+
+def set_admin_password(password):
+    if not password:
+        raise InvalidValueError('Password cannot be empty.')
+    filename = get_admin_password_file()
+    dirname = os.path.dirname(filename)
+    if dirname and not os.path.isdir(dirname):
+        os.makedirs(dirname)
+    with open(filename, 'w') as fp:
+        fp.write(password + '\n')
 
 
 class SSHClient(paramiko.SSHClient):
@@ -323,7 +374,7 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         self.ssh_client = self.get_ssh_client()
         self.debug = self.settings.get('debug', False)
         self.font = self.settings.get('font', '')
-        self.result = dict(id=None, status=None, encoding=None)
+        self.result = dict(id=None, status=None, encoding=None, token=None)
 
     def write_error(self, status_code, **kwargs):
         if swallow_http_errors and self.request.method == 'POST':
@@ -387,7 +438,34 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
                             hostname, port)
                     )
 
-    def get_args(self):
+    def get_token(self):
+        token = self.get_argument('token', u'').strip()
+        if not token:
+            return Worker.gen_id()
+
+        if len(token) > MAX_TOKEN_LENGTH:
+            raise InvalidValueError('Invalid token length.')
+
+        if not TOKEN_PATTERN.match(token):
+            raise InvalidValueError(
+                'Token must contain URL-safe characters only.'
+            )
+
+        return token
+
+    def get_identity(self, hostname, port, username, password, privatekey,
+                     passphrase):
+        payload = json.dumps(
+            [hostname, port, username, password, privatekey, passphrase],
+            sort_keys=True
+        )
+        return hashlib.sha256(to_bytes(payload)).hexdigest()
+
+    def get_args(self, require_target=True):
+        token = self.get_argument('token', u'').strip()
+        if not require_target and token and not self.get_argument('hostname', u'').strip():
+            return None, None
+
         hostname = self.get_hostname()
         port = self.get_port()
         username = self.get_value('username')
@@ -406,9 +484,12 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
 
         self.ssh_client.totp = totp
         args = (hostname, port, username, password, pkey)
+        identity = self.get_identity(
+            hostname, port, username, password, privatekey, passphrase
+        )
         logging.debug(args)
 
-        return args
+        return args, identity
 
     def parse_encoding(self, data):
         try:
@@ -446,7 +527,25 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         logging.warning('Could not detect the default encoding.')
         return 'utf-8'
 
-    def ssh_connect(self, args):
+    def open_shell_channel(self, ssh, term):
+        chan = ssh.get_transport().open_session()
+        chan.get_pty(term=term)
+
+        env = {
+            'TERM': term,
+            'COLORTERM': 'truecolor',
+            'CLICOLOR': '1',
+            'FORCE_COLOR': '3'
+        }
+        try:
+            chan.update_environment(env)
+        except paramiko.SSHException as exc:
+            logging.info('Could not set shell environment: {}'.format(exc))
+
+        chan.invoke_shell()
+        return chan
+
+    def ssh_connect(self, args, token, identity):
         ssh = self.ssh_client
         dst_addr = args[:2]
         logging.info('Connecting to {}:{}'.format(*dst_addr))
@@ -462,10 +561,14 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         except paramiko.BadHostKeyException:
             raise ValueError('Bad host key.')
 
-        term = self.get_argument('term', u'') or u'xterm'
-        chan = ssh.invoke_shell(term=term)
+        term = self.get_argument('term', u'') or u'xterm-256color'
+        chan = self.open_shell_channel(ssh, term)
         chan.setblocking(0)
-        worker = Worker(self.loop, ssh, chan, dst_addr)
+        worker = Worker(
+            self.loop, ssh, chan, dst_addr, token=token, identity=identity,
+            hostname=args[0], username=args[2], term=term,
+            max_output_cache=options.output_cache_size
+        )
         worker.encoding = options.encoding if options.encoding else \
             self.get_default_encoding(ssh)
         return worker
@@ -497,33 +600,196 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
             raise ValueError('Uncaught exception')
 
         ip, port = self.get_client_addr()
-        workers = clients.get(ip, {})
-        if workers and len(workers) >= options.maxconn:
-            raise tornado.web.HTTPError(403, 'Too many live connections.')
-
         self.check_origin()
 
         try:
-            args = self.get_args()
+            token = self.get_token()
+            worker = sessions.get(token)
+            if worker and worker.closed:
+                sessions.pop(token)
+                worker = None
+            args, identity = self.get_args(require_target=worker is None)
         except InvalidValueError as exc:
             raise tornado.web.HTTPError(400, str(exc))
 
-        future = self.executor.submit(self.ssh_connect, args)
+        workers = clients.get(ip, {})
 
-        try:
-            worker = yield future
-        except (ValueError, paramiko.SSHException) as exc:
-            logging.error(traceback.format_exc())
-            self.result.update(status=str(exc))
+        if worker:
+            if identity is not None and worker.identity != identity:
+                raise tornado.web.HTTPError(
+                    403, 'Token is already used by another session. Leave host/user/password empty and use token only to reattach it.'
+                )
         else:
-            if not workers:
-                clients[ip] = workers
-            worker.src_addr = (ip, port)
-            workers[worker.id] = worker
-            self.loop.call_later(options.delay, recycle_worker, worker)
-            self.result.update(id=worker.id, encoding=worker.encoding)
+            if workers and len(workers) >= options.maxconn:
+                raise tornado.web.HTTPError(403, 'Too many live connections.')
+
+            future = self.executor.submit(self.ssh_connect, args, token,
+                                          identity)
+
+            try:
+                worker = yield future
+            except (ValueError, paramiko.SSHException) as exc:
+                logging.error(traceback.format_exc())
+                self.result.update(status=str(exc))
+                worker = None
+            else:
+                sessions[token] = worker
+                self.loop.call_later(options.delay, recycle_worker, worker)
+
+        if worker:
+            bind_worker_to_client(worker, (ip, port))
+            self.result.update(
+                id=worker.id, encoding=worker.encoding, token=worker.token
+            )
 
         self.write(self.result)
+
+
+class SessionsHandler(MixinHandler, tornado.web.RequestHandler):
+
+    def initialize(self, loop):
+        super(SessionsHandler, self).initialize(loop)
+
+    def is_authenticated(self):
+        return self.get_secure_cookie(ADMIN_COOKIE_NAME) == to_bytes(
+            get_admin_password()
+        )
+
+    def require_auth(self):
+        if not self.is_authenticated():
+            self.render('sessions.html', sessions=[], history=[],
+                        authenticated=False, message='')
+            return False
+        return True
+
+    def get_sessions(self):
+        now = time.time()
+        result = []
+
+        for token, worker in sorted(sessions.items()):
+            if worker.closed:
+                continue
+
+            result.append(dict(
+                token=token,
+                id=worker.id,
+                hostname=worker.hostname,
+                port=worker.dst_addr[1],
+                username=worker.username or '',
+                term=worker.term or '',
+                fd=worker.fd,
+                attached=bool(worker.handler),
+                client='{}:{}'.format(*worker.src_addr)
+                if hasattr(worker, 'src_addr') else '',
+                created_seconds=int(now - worker.created_at),
+                detached_seconds=int(now - worker.detached_at)
+                if worker.detached_at else None,
+                output_cache_size=worker.output_cache_size
+            ))
+
+        return result
+
+    def get_history(self):
+        now = time.time()
+        result = []
+        for item in list(session_history):
+            row = item.copy()
+            row['closed_seconds'] = int(now - row['closed_at'])
+            result.append(row)
+        return result
+
+    def get(self):
+        if not self.require_auth():
+            return
+        self.render('sessions.html', sessions=self.get_sessions(),
+                    history=self.get_history(), authenticated=True,
+                    message='')
+
+    def post(self):
+        action = self.get_argument('action', '')
+
+        if action == 'login':
+            password = self.get_argument('password', '')
+            if password == get_admin_password():
+                self.set_secure_cookie(ADMIN_COOKIE_NAME, password)
+                self.redirect('/sessions')
+            else:
+                self.render('sessions.html', sessions=[], history=[],
+                            authenticated=False, message='Invalid password.')
+            return
+
+        if not self.require_auth():
+            return
+
+        if action == 'logout':
+            self.clear_cookie(ADMIN_COOKIE_NAME)
+            self.redirect('/sessions')
+            return
+
+        if action == 'password':
+            old_password = self.get_argument('old_password', '')
+            new_password = self.get_argument('new_password', '')
+            confirm_password = self.get_argument('confirm_password', '')
+            if old_password != get_admin_password():
+                message = 'Current password is wrong.'
+            elif not new_password:
+                message = 'New password cannot be empty.'
+            elif new_password != confirm_password:
+                message = 'New passwords do not match.'
+            else:
+                set_admin_password(new_password)
+                self.set_secure_cookie(ADMIN_COOKIE_NAME, new_password)
+                message = 'Password changed.'
+            self.render('sessions.html', sessions=self.get_sessions(),
+                        history=self.get_history(), authenticated=True,
+                        message=message)
+            return
+
+        if action != 'close':
+            raise tornado.web.HTTPError(400, 'Unsupported action.')
+
+        token = self.get_argument('token', '')
+        worker = sessions.get(token)
+        if not worker or worker.closed:
+            raise tornado.web.HTTPError(404, 'Session not found.')
+
+        worker.close(reason='closed from sessions manager')
+        self.redirect('/sessions')
+
+
+class AttachHandler(MixinHandler, tornado.web.RequestHandler):
+
+    def initialize(self, loop):
+        super(AttachHandler, self).initialize(loop)
+
+    def is_authenticated(self):
+        return self.get_secure_cookie(ADMIN_COOKIE_NAME) == to_bytes(
+            get_admin_password()
+        )
+
+    def get(self):
+        if not self.is_authenticated():
+            self.redirect('/sessions')
+            return
+
+        token = self.get_argument('token', '').strip()
+        worker = sessions.get(token)
+        if not worker or worker.closed:
+            raise tornado.web.HTTPError(404, 'Session not found.')
+
+        bind_worker_to_client(worker, self.get_client_addr())
+        title = '{}@{}:{}'.format(
+            worker.username or '', worker.hostname, worker.dst_addr[1]
+        )
+        attach = dict(
+            id=worker.id,
+            token=worker.token,
+            encoding=worker.encoding,
+            title=title
+        )
+        self.render(
+            'attach.html', attach_json=json.dumps(attach), title=title
+        )
 
 
 class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
@@ -547,18 +813,17 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
             self.close(reason=str(exc))
         else:
             worker = workers.get(worker_id)
-            if worker:
-                workers[worker_id] = None
+            if worker and not worker.closed:
                 self.set_nodelay(True)
                 worker.set_handler(self)
                 self.worker_ref = weakref.ref(worker)
-                self.loop.add_handler(worker.fd, worker, IOLoop.READ)
+                worker.add_loop_handler()
             else:
                 self.close(reason='Websocket authentication failed.')
 
     def on_message(self, message):
         logging.debug('{!r} from {}:{}'.format(message, *self.src_addr))
-        worker = self.worker_ref()
+        worker = self.worker_ref() if self.worker_ref else None
         if not worker:
             # The worker has likely been closed. Do not process.
             logging.debug(
@@ -584,14 +849,13 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
         resize = msg.get('resize')
         if resize and len(resize) == 2:
             try:
-                worker.chan.resize_pty(*resize)
+                worker.resize(*resize)
             except (TypeError, struct.error, paramiko.SSHException):
                 pass
 
         data = msg.get('data')
         if data and isinstance(data, UnicodeType):
-            worker.data_to_dst.append(data)
-            worker.on_write()
+            worker.write_input(data)
 
     def on_close(self):
         logging.info('Disconnected from {}:{}'.format(*self.src_addr))
@@ -600,4 +864,4 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
 
         worker = self.worker_ref() if self.worker_ref else None
         if worker:
-            worker.close(reason=self.close_reason)
+            worker.detach_handler(self)

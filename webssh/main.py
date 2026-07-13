@@ -1,14 +1,19 @@
 import logging
+import os
 import tornado.web
 import tornado.ioloop
 
 from tornado.options import options
 from webssh import handler
-from webssh.handler import IndexHandler, WsockHandler, NotFoundHandler
+from webssh.handler import (
+    AttachHandler, IndexHandler, SessionsHandler, WsockHandler,
+    NotFoundHandler
+)
 from webssh.settings import (
     get_app_settings,  get_host_keys_settings, get_policy_setting,
     get_ssl_context, get_server_settings, check_encoding_setting
 )
+from webssh.gateway import SSHGateway
 
 
 def make_handlers(loop, options):
@@ -18,6 +23,8 @@ def make_handlers(loop, options):
     handlers = [
         (r'/', IndexHandler, dict(loop=loop, policy=policy,
                                   host_keys_settings=host_keys_settings)),
+        (r'/sessions', SessionsHandler, dict(loop=loop)),
+        (r'/attach', AttachHandler, dict(loop=loop)),
         (r'/ws', WsockHandler, dict(loop=loop))
     ]
     return handlers
@@ -48,6 +55,15 @@ def main():
     ssl_ctx = get_ssl_context(options)
     server_settings = get_server_settings(options)
     app_listen(app, options.port, options.address, server_settings)
+    if options.ssh_gateway_port:
+        host_key = options.ssh_gateway_host_key or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'env', 'ssh_gateway_host_key'
+        )
+        SSHGateway(
+            loop, options.ssh_gateway_address, options.ssh_gateway_port,
+            host_key, options.ssh_gateway_authorized_keys
+        ).start()
     if ssl_ctx:
         server_settings.update(ssl_options=ssl_ctx)
         app_listen(app, options.sslport, options.ssladdress, server_settings)

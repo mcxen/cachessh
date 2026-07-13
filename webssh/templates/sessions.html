@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <title>会话管理</title>
+    <link href="/static/img/favicon.png" rel="icon" type="image/png">
+    <link href="/static/css/bootstrap.min.css" rel="stylesheet" type="text/css"/>
+    <style>
+      body {
+        min-height: 100vh;
+        background: #f3f6fb;
+        color: #1f2937;
+      }
+
+      .page-wrap {
+        padding: 24px 16px;
+      }
+
+      .topbar {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+        padding: 16px 18px;
+        margin-bottom: 18px;
+      }
+
+      .login-card {
+        max-width: 430px;
+        margin: 9vh auto 0;
+        border: 0;
+        border-radius: 16px;
+        box-shadow: 0 18px 45px rgba(15, 23, 42, 0.12);
+      }
+
+      .login-card .card-body {
+        padding: 28px;
+      }
+
+      .panel-card {
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.05);
+        margin-bottom: 18px;
+      }
+
+      .panel-card .card-header {
+        background: #ffffff;
+        border-bottom: 1px solid #eef2f7;
+        font-weight: 600;
+      }
+
+      .table-card {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.05);
+        overflow: hidden;
+      }
+
+      .table-responsive {
+        margin-bottom: 0;
+      }
+
+      .table {
+        margin-bottom: 0;
+      }
+
+      .table td,
+      .table th {
+        vertical-align: middle;
+        white-space: nowrap;
+      }
+
+      .table td.token-cell {
+        white-space: normal;
+        min-width: 260px;
+      }
+
+      code {
+        word-break: break-all;
+        white-space: normal;
+      }
+
+      .status {
+        display: inline-block;
+        min-width: 82px;
+      }
+
+      .muted-help {
+        color: #6b7280;
+        font-size: 13px;
+      }
+
+      @media (max-width: 768px) {
+        .page-wrap {
+          padding: 14px 8px;
+        }
+
+        .topbar {
+          border-radius: 10px;
+        }
+
+        .topbar-actions {
+          margin-top: 12px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    {% if not authenticated %}
+      <div class="page-wrap">
+        <div class="card login-card">
+          <div class="card-body">
+            <h4 class="mb-2">会话管理</h4>
+            <p class="muted-help mb-4">请输入管理密码后查看和关闭占用中的投影/终端会话。</p>
+
+            {% if message %}
+              <div class="alert alert-danger py-2">{{ message }}</div>
+            {% end %}
+
+            <form action="/sessions" method="post">
+              {% module xsrf_form_html() %}
+              <input type="hidden" name="action" value="login">
+              <div class="form-group">
+                <label for="password">管理密码</label>
+                <input class="form-control form-control-lg" type="password" id="password" name="password" autofocus required>
+                <small class="form-text text-muted">默认密码：1234。登录后请在管理界面修改。</small>
+              </div>
+              <div class="d-flex justify-content-between align-items-center">
+                <a class="btn btn-outline-secondary" href="/">返回连接页</a>
+                <button type="submit" class="btn btn-primary px-4">登录</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+    {% else %}
+      <div class="container-fluid page-wrap">
+        <div class="topbar d-md-flex justify-content-between align-items-center">
+          <div>
+            <h4 class="mb-1">会话管理</h4>
+            <div class="muted-help">查看当前保留的 Token 会话，必要时关闭被占用的投影/终端。</div>
+          </div>
+          <div class="topbar-actions">
+            <a class="btn btn-outline-secondary btn-sm" href="/">返回连接页</a>
+            <form class="d-inline" action="/sessions" method="post">
+              {% module xsrf_form_html() %}
+              <input type="hidden" name="action" value="logout">
+              <button type="submit" class="btn btn-outline-danger btn-sm">退出登录</button>
+            </form>
+          </div>
+        </div>
+
+        {% if message %}
+          <div class="alert alert-info py-2">{{ message }}</div>
+        {% end %}
+
+        <div class="card panel-card">
+          <div class="card-header">修改管理密码</div>
+          <div class="card-body">
+            <form action="/sessions" method="post">
+              {% module xsrf_form_html() %}
+              <input type="hidden" name="action" value="password">
+              <div class="form-row align-items-end">
+                <div class="col-lg-3 col-md-6 mb-2">
+                  <label>当前密码</label>
+                  <input class="form-control" type="password" name="old_password" placeholder="当前密码" required>
+                </div>
+                <div class="col-lg-3 col-md-6 mb-2">
+                  <label>新密码</label>
+                  <input class="form-control" type="password" name="new_password" placeholder="新密码" required>
+                </div>
+                <div class="col-lg-3 col-md-6 mb-2">
+                  <label>确认新密码</label>
+                  <input class="form-control" type="password" name="confirm_password" placeholder="再次输入新密码" required>
+                </div>
+                <div class="col-lg-3 col-md-6 mb-2">
+                  <button type="submit" class="btn btn-primary btn-block">保存新密码</button>
+                </div>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <h5 class="mb-2">当前会话</h5>
+        <div class="table-card mb-4">
+          <div class="table-responsive">
+            <table class="table table-sm table-hover">
+              <thead class="thead-light">
+                <tr>
+                  <th>目标</th>
+                  <th>用户</th>
+                  <th>TTY</th>
+                  <th>Token</th>
+                  <th>状态</th>
+                  <th>客户端</th>
+                  <th>时长</th>
+                  <th>缓存</th>
+                  <th class="text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% if sessions %}
+                  {% for item in sessions %}
+                    <tr>
+                      <td>{{ item['hostname'] }}:{{ item['port'] }}</td>
+                      <td>{{ item['username'] }}</td>
+                      <td>{{ item['term'] }} / fd {{ item['fd'] }}</td>
+                      <td class="token-cell"><code>{{ item['token'] }}</code></td>
+                      <td>
+                        {% if item['attached'] %}
+                          <span class="badge badge-success status">使用中</span>
+                        {% else %}
+                          <span class="badge badge-secondary status">已断开</span>
+                          {% if item['detached_seconds'] is not None %}
+                            <span class="muted-help">{{ item['detached_seconds'] }}s</span>
+                          {% end %}
+                        {% end %}
+                      </td>
+                      <td>{{ item['client'] }}</td>
+                      <td>{{ item['created_seconds'] }}s</td>
+                      <td>{{ item['output_cache_size'] }} bytes</td>
+                      <td class="text-right">
+                        <a class="btn btn-success btn-sm" href="/attach?token={{ item['token'] }}">接入</a>
+                        <form class="d-inline" action="/sessions" method="post" onsubmit="return confirm('确定关闭这个会话吗？');">
+                          {% module xsrf_form_html() %}
+                          <input type="hidden" name="action" value="close">
+                          <input type="hidden" name="token" value="{{ item['token'] }}">
+                          <button type="submit" class="btn btn-danger btn-sm">关闭</button>
+                        </form>
+                      </td>
+                    </tr>
+                  {% end %}
+                {% else %}
+                  <tr>
+                    <td colspan="9" class="text-center text-muted py-4">暂无打开的会话</td>
+                  </tr>
+                {% end %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <h5 class="mb-2">会话历史</h5>
+        <div class="table-card">
+          <div class="table-responsive">
+            <table class="table table-sm table-hover">
+              <thead class="thead-light">
+                <tr>
+                  <th>目标</th>
+                  <th>用户</th>
+                  <th>TTY</th>
+                  <th>Token</th>
+                  <th>客户端</th>
+                  <th>持续时间</th>
+                  <th>关闭时间</th>
+                  <th>缓存</th>
+                  <th>原因</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% if history %}
+                  {% for item in history %}
+                    <tr>
+                      <td>{{ item['hostname'] }}:{{ item['port'] }}</td>
+                      <td>{{ item['username'] }}</td>
+                      <td>{{ item['term'] }}</td>
+                      <td class="token-cell"><code>{{ item['token'] }}</code></td>
+                      <td>{{ item['client'] }}</td>
+                      <td>{{ item['lifetime_seconds'] }}s</td>
+                      <td>{{ item['closed_seconds'] }}s 前</td>
+                      <td>{{ item['output_cache_size'] }} bytes</td>
+                      <td>{{ item['reason'] }}</td>
+                    </tr>
+                  {% end %}
+                {% else %}
+                  <tr>
+                    <td colspan="9" class="text-center text-muted py-4">暂无历史记录</td>
+                  </tr>
+                {% end %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    {% end %}
+  </body>
+</html>

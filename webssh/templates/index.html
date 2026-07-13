@@ -77,12 +77,16 @@
             <input class="form-control" type="password" id="totp" name="totp" value="">
           </div>
           <div class="col">
+            <label for="token">Access Token</label>
+            <input class="form-control" type="text" id="token" name="token" value="" autocomplete="off">
           </div>
         </div>
         <input type="hidden" id="term" name="term" value="xterm-256color">
         {% module xsrf_form_html() %}
         <button type="submit" class="btn btn-primary">Connect</button>
         <button type="reset" class="btn btn-danger">Reset</button>
+        <a href="/sessions" class="btn btn-secondary">管理界面</a>
+        <small class="form-text text-muted">如需恢复已有投影/终端会话，只填写 Access Token 后点击 Connect 即可。</small>
       </form>
     </div>
 
