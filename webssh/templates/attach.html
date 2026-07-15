@@ -2,10 +2,11 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <title>{{ title }}</title>
     <link href="/static/img/favicon.png" rel="icon" type="image/png">
     <link href="/static/css/xterm.min.css" rel="stylesheet" type="text/css"/>
+    <link href="/static/css/mobile.css?v=20260713" rel="stylesheet" type="text/css"/>
     <style>
       html,
       body {
@@ -42,7 +43,7 @@
       }
     </style>
   </head>
-  <body>
+  <body class="attach-page">
     <div id="terminal"></div>
     <div class="toolbar">
       <a href="/sessions">会话管理</a>
@@ -50,6 +51,7 @@
 
     <script src="/static/js/xterm.min.js"></script>
     <script src="/static/js/xterm-addon-fit.min.js"></script>
+    <script src="/static/js/mobile-terminal.js?v=20260713"></script>
     <script>
       (function () {
         var attach = {% raw attach_json %};
@@ -58,6 +60,7 @@
           allowTransparency: true,
           drawBoldTextInBrightColors: true,
           macOptionIsMeta: true,
+          scrollback: window.MobileTerminalControls.isMobileDevice() ? 300 : 1000,
           windowsMode: true,
           theme: {
             background: '#000000',
@@ -83,6 +86,7 @@
         };
         var term = new window.Terminal(config);
         var fitAddon = new window.FitAddon.FitAddon();
+        var mobileControls;
         var decoder;
         var wsBase = window.location.href.split(/\?|#/, 1)[0]
           .replace('/attach', '/ws')
@@ -110,6 +114,16 @@
           }
         }
 
+        mobileControls = window.MobileTerminalControls.init({
+          terminal: term,
+          send: function (data) {
+            if (sock.readyState === window.WebSocket.OPEN) {
+              sock.send(JSON.stringify({'data': data}));
+            }
+          },
+          onResize: resize
+        });
+
         sock.onopen = function () {
           resize();
           window.document.title = attach.title || 'Persistent TTY';
@@ -135,6 +149,10 @@
 
         sock.onclose = function (event) {
           term.write(decoder.decode());
+          if (mobileControls) {
+            mobileControls.destroy();
+            mobileControls = null;
+          }
           if (event.reason) {
             term.write('\r\n' + event.reason + '\r\n');
           }

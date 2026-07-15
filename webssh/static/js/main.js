@@ -194,8 +194,14 @@ jQuery(function($){
       }
     }
 
-    var cols = parseInt(window.innerWidth / style.width, 10) - 1;
-    var rows = parseInt(window.innerHeight / style.height, 10);
+    var shortcutBar = document.querySelector('.mobile-shortcuts'),
+        viewportWidth = window.visualViewport ?
+          Math.min(window.innerWidth, window.visualViewport.width) : window.innerWidth,
+        viewportHeight = window.visualViewport ?
+          Math.min(window.innerHeight, window.visualViewport.height) : window.innerHeight,
+        shortcutHeight = shortcutBar ? shortcutBar.offsetHeight : 0;
+    var cols = parseInt(viewportWidth / style.width, 10) - 1;
+    var rows = parseInt((viewportHeight - shortcutHeight) / style.height, 10);
     return {'cols': cols, 'rows': rows};
   }
 
@@ -411,11 +417,13 @@ jQuery(function($){
         encoding = 'utf-8',
         decoder = window.TextDecoder ? new window.TextDecoder(encoding) : encoding,
         terminal = document.getElementById('terminal'),
+        mobile_controls,
         termOptions = {
           cursorBlink: true,
           allowTransparency: true,
           drawBoldTextInBrightColors: true,
           macOptionIsMeta: true,
+          scrollback: window.MobileTerminalControls.isMobileDevice() ? 300 : 1000,
           windowsMode: true,
           theme: build_terminal_theme()
         };
@@ -576,6 +584,19 @@ jQuery(function($){
       term.open(terminal);
       toggle_fullscreen(term);
       update_font_family(term);
+      mobile_controls = window.MobileTerminalControls.init({
+        terminal: term,
+        send: function (data) {
+          if (sock && sock.readyState === window.WebSocket.OPEN) {
+            sock.send(JSON.stringify({'data': data}));
+          }
+        },
+        onResize: function () {
+          if (term) {
+            resize_terminal(term);
+          }
+        }
+      });
       term.focus();
       state = CONNECTED;
       title_element.text = url_opts_data.title || default_title;
@@ -599,6 +620,10 @@ jQuery(function($){
         term_write(decoder.decode());
       }
       term.dispose();
+      if (mobile_controls) {
+        mobile_controls.destroy();
+        mobile_controls = undefined;
+      }
       term = undefined;
       sock = undefined;
       reset_wssh();

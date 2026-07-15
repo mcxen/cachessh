@@ -71,6 +71,9 @@ WebSSH keeps a bounded ANSI replay buffer for each tty. When you reattach,
 the browser receives the recent terminal stream again so xterm.js can rebuild
 the visible screen, which is closer to a tmux attach than a blank reconnect.
 Use `--output_cache_size` to tune the retained replay bytes.
+The default replay limit is 256 KiB. In the browser, xterm.js automatically
+discards the oldest history beyond 300 lines on mobile devices and 1000 lines
+on larger screens.
 
 New shells are opened with `TERM=xterm-256color`, `COLORTERM=truecolor`,
 `CLICOLOR=1`, and `FORCE_COLOR=3` so modern CLIs can emit 256-color and

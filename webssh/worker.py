@@ -68,7 +68,7 @@ def recycle_worker(worker):
 class Worker(object):
     def __init__(self, loop, ssh, chan, dst_addr, token=None,
                  identity=None, hostname=None, username=None, term=None,
-                 max_output_cache=1024 * 1024):
+                 max_output_cache=256 * 1024):
         self.loop = loop
         self.ssh = ssh
         self.chan = chan
