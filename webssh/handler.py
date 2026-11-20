@@ -60,6 +60,20 @@ def bind_worker_to_client(worker, src_addr):
     return workers
 
 
+def find_worker(worker_id):
+    """Find a live worker without depending on the client's network path.
+
+    The browser's HTTP request and WebSocket upgrade may arrive through
+    different proxy paths, so their apparent client IPs are not a reliable
+    session key.  The worker id is already an unpredictable server-generated
+    capability and is sent only after the connection request has succeeded.
+    """
+    for workers in clients.values():
+        worker = workers.get(worker_id)
+        if worker and not worker.closed:
+            return worker
+
+
 def get_admin_password_file():
     filename = options.admin_password_file
     if not filename:
@@ -802,18 +816,16 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
         self.src_addr = self.get_client_addr()
         logging.info('Connected from {}:{}'.format(*self.src_addr))
 
-        workers = clients.get(self.src_addr[0])
-        if not workers:
-            self.close(reason='Websocket authentication failed.')
-            return
-
         try:
             worker_id = self.get_value('id')
         except (tornado.web.MissingArgumentError, InvalidValueError) as exc:
             self.close(reason=str(exc))
         else:
-            worker = workers.get(worker_id)
-            if worker and not worker.closed:
+            # Do not bind WebSocket authentication to the source IP.  A
+            # browser can use a proxy for the POST and a different route for
+            # the WebSocket upgrade, especially for localhost/IPv6.
+            worker = find_worker(worker_id)
+            if worker:
                 self.set_nodelay(True)
                 worker.set_handler(self)
                 self.worker_ref = weakref.ref(worker)
